@@ -1,0 +1,21 @@
+[package]
+name = "notion-entry"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[profile.dev.package.backtrace]
+opt-level = 3
+
+[dependencies]
+clap = { version = "3", features = ["derive"] }
+color-eyre = "0.6.0"
+date_time_parser = "0.1.1"
+dirs = "4.0.0"
+notion = { path = "../notion" }
+owo-colors = "3.2.0"
+serde = "1.0.133"
+serde_json = "1.0.74"
+tokio = "1.15.0"
+tracing = "0.1.29"
+tracing-subscriber = "0.3.5"
