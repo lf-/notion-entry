@@ -1,8 +1,7 @@
 #![feature(iter_intersperse)]
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
-use std::ops::Index;
+use std::io::{SeekFrom, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -14,7 +13,6 @@ use color_eyre::{
     eyre::{eyre, Context},
     Help,
 };
-use crossbeam_channel::Sender;
 use date_time_parser::DateParser;
 use notion::ids::{AsIdentifier, DatabaseId, PageId, PropertyId};
 use notion::models::properties::{
@@ -22,8 +20,8 @@ use notion::models::properties::{
     Relation, RelationValue,
 };
 use notion::models::search::DatabaseQuery;
-use notion::models::text::{RichText, RichTextCommon};
-use notion::models::{PageCreate, Parent};
+use notion::models::text::RichText;
+use notion::models::Parent;
 use notion::{models::search::NotionSearch, NotionApi};
 use owo_colors::colors::css;
 use owo_colors::{OwoColorize, Style};
@@ -31,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use skim::prelude::SkimOptionsBuilder;
 use skim::{Skim, SkimItem, SkimItemReceiver, SkimOptions};
 use tokio::fs::{read_to_string, OpenOptions};
-use tokio::io::{self, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tracing::field;
 
 fn path_for_config_item(name: &str) -> Result<PathBuf> {
@@ -58,19 +56,6 @@ struct PropertyReadConfig {
     default_values: HashMap<PropertyId, PropertyValue>,
 }
 
-struct PropEntryCommandDef {
-    name: &'static str,
-    usage: &'static str,
-    exec: Box<dyn Fn(&str, &mut PropertyReadConfig) -> Result<()>>,
-}
-
-enum PropEntryCommand {
-    /// Reorder it in the next config
-    Order(usize),
-    /// Set default to whatever is parsed from this
-    Default(String),
-}
-
 #[derive(Clone, Debug)]
 struct RelationItem {
     title: String,
@@ -87,8 +72,6 @@ struct RelationCache {
     db_name: String,
     items: Arc<Vec<RelationItem>>,
 }
-
-type SkimSource = (Sender<()>, SkimItemReceiver);
 
 impl RelationCache {
     async fn new(api: &NotionApi, db_id: &DatabaseId) -> Result<RelationCache> {
@@ -267,6 +250,28 @@ fn prompt_for(
     })
 }
 
+struct PropEntryCommandDef {
+    name: &'static str,
+    usage: &'static str,
+    exec: fn(&str, &mut PropertyReadConfig, &PropertyConfiguration) -> Result<()>,
+}
+
+static PROP_ENTRY_COMMANDS: &[PropEntryCommandDef] = &[PropEntryCommandDef {
+    name: "order",
+    usage: ":order N\nwhere N is the 0-indexed position it should be in",
+    exec: (|args, cf, prop| {
+        let new_pos = args.trim().parse::<usize>()?.min(cf.order.len() - 1);
+        let prop_id = prop.as_id();
+        let current_pos = cf.order.iter().position(|v| v == prop_id);
+        if let Some(current_pos) = current_pos {
+            cf.order.remove(current_pos);
+        }
+
+        cf.order.insert(new_pos, prop_id.clone());
+        Ok(())
+    }),
+}];
+
 fn get_props_from_user(
     props: Props,
     mut cfg: PropertyReadConfig,
@@ -281,12 +286,6 @@ fn get_props_from_user(
     }
 
     let mut next_cfg = cfg.clone();
-
-    let cmds = [PropEntryCommandDef {
-        name: "order",
-        usage: ":order N\nwhere N is the 0-indexed position it should be in",
-        exec: Box::new(|args, cf| Ok(())),
-    }];
 
     let mut outs = Vec::new();
 
@@ -328,15 +327,19 @@ fn get_props_from_user(
                         let (cmdname, rest) = entry.split_at(pos);
                         let cmdname = &cmdname[1..];
 
-                        for cmd in &cmds {
+                        for cmd in PROP_ENTRY_COMMANDS {
                             if cmd.name.starts_with(cmdname) {
-                                (cmd.exec)(rest, &mut next_cfg).expect("FIXME");
+                                let result = (cmd.exec)(rest, &mut next_cfg, &prop_def);
+                                if let Err(err) = result {
+                                    println!("Error: {}", err);
+                                    println!("Usage: {}", cmd.usage);
+                                }
                                 continue 'oneprop;
                             }
                         }
                         continue 'oneprop;
                     } else {
-                        let result = continue_parse(&entry);
+                        let result = continue_parse(&entry.trim_end());
                         tracing::debug!(?result, "parse result");
                         match result {
                             Some(v) => {
@@ -354,6 +357,12 @@ fn get_props_from_user(
 
                     match result {
                         Some(v) => {
+                            // FIXME: this could be implemented to be able to
+                            // create pages in the target database somehow.
+                            // would have to figure out how to get skim to do
+                            // this for us more cleverly though!
+                            //
+                            // Also, we do not handle aborts, which we should.
                             tracing::debug!(?v.query, ?v.cmd, ?v.final_event, "skim returns");
                             if let Some(v) = to_value(v.selected_items) {
                                 outs.push(v);
@@ -397,7 +406,7 @@ async fn async_main(args: Args) -> Result<()> {
             let db = api.get_database(&db_id).await?;
             tracing::debug!(props = field::debug(&db.properties), "db props");
 
-            let read_config: PropertyReadConfig = get_config_item("properties.json")
+            let mut read_config: PropertyReadConfig = get_config_item("properties.json")
                 .await
                 .and_then(|content| serde_json::from_str(&content).note(""))
                 .unwrap_or_default();
@@ -417,7 +426,6 @@ async fn async_main(args: Args) -> Result<()> {
 
             let mut properties_file = OpenOptions::new()
                 .write(true)
-                .truncate(true)
                 .create(true)
                 .open(path_for_config_item("properties.json")?)
                 .await?;
@@ -426,19 +434,22 @@ async fn async_main(args: Args) -> Result<()> {
             loop {
                 let props = db.properties.clone();
                 let caches = relation_caches.clone();
-                let read_config = read_config.clone();
+                let this_run_read_config = read_config.clone();
 
                 let (new_values, new_config) = tokio::task::spawn_blocking(move || {
-                    get_props_from_user(props, read_config, &caches)
+                    get_props_from_user(props, this_run_read_config, &caches)
                 })
                 .await?;
 
                 tracing::debug!(?new_values, ?new_config, "new values from user");
 
                 properties_file.set_len(0).await?;
+                properties_file.seek(SeekFrom::Start(0)).await?;
                 properties_file
                     .write_all(&serde_json::to_vec(&new_config)?)
                     .await?;
+                properties_file.sync_data().await?;
+                read_config = new_config;
 
                 api.create_page(
                     &Parent::Database {
