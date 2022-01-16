@@ -1,4 +1,6 @@
 #![feature(iter_intersperse)]
+mod util;
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{SeekFrom, Write};
@@ -31,6 +33,8 @@ use skim::{Skim, SkimItem, SkimItemReceiver, SkimOptions};
 use tokio::fs::{read_to_string, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tracing::field;
+
+use crate::util::IndentedText;
 
 fn path_for_config_item(name: &str) -> Result<PathBuf> {
     let mut path = dirs::config_dir().ok_or(eyre!("couldn't get config dir"))?;
@@ -272,12 +276,92 @@ static PROP_ENTRY_COMMANDS: &[PropEntryCommandDef] = &[PropEntryCommandDef {
     }),
 }];
 
+enum PromptResult {
+    TryAgain,
+    NextProp(Option<PropertyValue>),
+}
+
+fn text_prompt(
+    prompt: &str,
+    continue_parse: ParseContinuation,
+    prop_def: &PropertyConfiguration,
+    next_cfg: &mut PropertyReadConfig,
+) -> PromptResult {
+    println!("{}", prompt);
+    print!("> ");
+    std::io::stdout().flush().expect("flush stdout");
+
+    let mut entry = String::new();
+    std::io::stdin()
+        .read_line(&mut entry)
+        .expect("line read fail");
+
+    if entry.starts_with(':') {
+        let pos = entry.find(' ').unwrap_or(entry.len());
+        let (cmdname, rest) = entry.split_at(pos);
+        let cmdname = &cmdname[1..];
+
+        for cmd in PROP_ENTRY_COMMANDS {
+            if cmd.name.starts_with(cmdname) {
+                let result = (cmd.exec)(rest, next_cfg, &prop_def);
+                if let Err(err) = result {
+                    println!("Error: {}", err);
+                    println!("Usage:\n{}", IndentedText(4, cmd.usage));
+                }
+                return PromptResult::TryAgain;
+            }
+        }
+
+        println!("Unknown command. Supported commands:");
+        for cmd in PROP_ENTRY_COMMANDS {
+            println!("{}:\n{}", cmd.name, IndentedText(4, cmd.usage));
+        }
+        println!();
+
+        PromptResult::TryAgain
+    } else {
+        let result = continue_parse(&entry.trim_end());
+        tracing::debug!(?result, "parse result");
+        match result {
+            Some(v) => PromptResult::NextProp(Some(v)),
+            None => PromptResult::TryAgain,
+        }
+    }
+}
+
+fn skim_prompt<'a>(
+    prompt: &'a str,
+    mut skim_options: SkimOptions<'a>,
+    skim_channel: SkimItemReceiver,
+    to_value: SkimToValue,
+) -> PromptResult {
+    skim_options.prompt = Some(prompt);
+
+    let result = Skim::run_with(&skim_options, Some(skim_channel));
+
+    match result {
+        Some(v) => {
+            // FIXME: this could be implemented to be able to
+            // create pages in the target database somehow.
+            // would have to figure out how to get skim to do
+            // this for us more cleverly though!
+            //
+            // Also, we do not handle aborts, which we should.
+            tracing::debug!(?v.query, ?v.cmd, ?v.final_event, "skim returns");
+            PromptResult::NextProp(to_value(v.selected_items))
+        }
+        None => {
+            tracing::debug!("skim returned nothing");
+            PromptResult::NextProp(None)
+        }
+    }
+}
+
 fn get_props_from_user(
     props: Props,
     mut cfg: PropertyReadConfig,
     relation_caches: &HashMap<DatabaseId, RelationCache>,
 ) -> (Vec<PropertyValue>, PropertyReadConfig) {
-    // order now has all of the props
     let have_props = cfg.order.iter().cloned().collect::<HashSet<_>>();
     for prop in props.values() {
         if !have_props.contains(prop.as_id()) {
@@ -285,12 +369,11 @@ fn get_props_from_user(
         }
     }
 
+    // order now has all of the props
     let mut next_cfg = cfg.clone();
 
     let mut outs = Vec::new();
 
-    // FIXME: the text and skim select types should be extracted into their own
-    // functions
     'props: for prop in cfg.order.iter() {
         'oneprop: loop {
             let prop_def = props.iter().find(|(_name, v)| v.as_id() == prop);
@@ -311,71 +394,22 @@ fn get_props_from_user(
                 }
             };
 
-            match prompt {
+            match match prompt {
                 PromptType::Text(prompt, continue_parse) => {
-                    println!("{}", prompt);
-                    print!("> ");
-                    std::io::stdout().flush().expect("flush stdout");
-
-                    let mut entry = String::new();
-                    std::io::stdin()
-                        .read_line(&mut entry)
-                        .expect("line read fail");
-
-                    if entry.starts_with(':') {
-                        let pos = entry.find(' ').expect("FIXME");
-                        let (cmdname, rest) = entry.split_at(pos);
-                        let cmdname = &cmdname[1..];
-
-                        for cmd in PROP_ENTRY_COMMANDS {
-                            if cmd.name.starts_with(cmdname) {
-                                let result = (cmd.exec)(rest, &mut next_cfg, &prop_def);
-                                if let Err(err) = result {
-                                    println!("Error: {}", err);
-                                    println!("Usage: {}", cmd.usage);
-                                }
-                                continue 'oneprop;
-                            }
-                        }
-                        continue 'oneprop;
-                    } else {
-                        let result = continue_parse(&entry.trim_end());
-                        tracing::debug!(?result, "parse result");
-                        match result {
-                            Some(v) => {
-                                outs.push(v);
-                                continue 'props;
-                            }
-                            None => continue 'oneprop,
-                        }
-                    }
+                    text_prompt(&prompt, continue_parse, &prop_def, &mut next_cfg)
                 }
-                PromptType::Skim(prompt, mut skim_options, skim_channel, to_value) => {
-                    skim_options.prompt = Some(&prompt);
-
-                    let result = Skim::run_with(&skim_options, Some(skim_channel));
-
-                    match result {
-                        Some(v) => {
-                            // FIXME: this could be implemented to be able to
-                            // create pages in the target database somehow.
-                            // would have to figure out how to get skim to do
-                            // this for us more cleverly though!
-                            //
-                            // Also, we do not handle aborts, which we should.
-                            tracing::debug!(?v.query, ?v.cmd, ?v.final_event, "skim returns");
-                            if let Some(v) = to_value(v.selected_items) {
-                                outs.push(v);
-                            }
-                            continue 'props;
-                        }
-                        None => {
-                            tracing::debug!("skim returned nothing");
-                            continue 'props;
-                        }
-                    }
+                PromptType::Skim(prompt, skim_options, skim_channel, to_value) => {
+                    skim_prompt(&prompt, skim_options, skim_channel, to_value)
                 }
-            }
+            } {
+                PromptResult::TryAgain => continue 'oneprop,
+                PromptResult::NextProp(v) => {
+                    if let Some(v) = v {
+                        outs.push(v);
+                    }
+                    continue 'props;
+                }
+            };
         }
     }
 
