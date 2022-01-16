@@ -485,14 +485,17 @@ async fn async_main(args: Args) -> Result<()> {
                 properties_file.sync_data().await?;
                 read_config = new_config;
 
-                api.create_page(
-                    &Parent::Database {
-                        database_id: db_id.clone(),
-                    },
-                    &new_values,
-                    &[],
-                )
-                .await?;
+                let page = api
+                    .create_page(
+                        &Parent::Database {
+                            database_id: db_id.clone(),
+                        },
+                        &new_values,
+                        &[],
+                    )
+                    .await?;
+
+                println!("Page created: {}\n", page.url);
             }
         }
     }
