@@ -38,7 +38,15 @@ Pick the database you want to enter items into from that list, and enter its
 UUID in a file called `database` in the configuration directory you saw
 previously.
 
-Run `notion-entry add`. It will prompt you for the data you want to enter. From
-here, you can reorder fields by typing the `:order` command into any textual
-field.
+Run `notion-entry add`. It will prompt you for the data you want to enter.
+
+Notes on the UI:
+
+* You can reorder fields by typing the `:order` command into any textual
+  field.
+* The relation selection uses the multi selection mode of
+  [skim](https://github.com/lotabout/skim), which uses the <kbd>Tab</kbd> key
+  to select items, and <kbd>Enter</kbd> to accept the input.
+* Colours on select items are just what you have set on the Notion web
+  interface.
 
