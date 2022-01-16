@@ -910,6 +910,7 @@ dependencies = [
 [[package]]
 name = "notion"
 version = "0.3.4"
+source = "git+https://github.com/lf-/notion?branch=prepare-for-create-page#9756257bd9fc3ce6617751a28ac7d5caf61b57cc"
 dependencies = [
  "chrono",
  "reqwest",

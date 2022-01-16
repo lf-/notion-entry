@@ -13,7 +13,6 @@ color-eyre = "0.6.0"
 crossbeam-channel = "0.5.2"
 date_time_parser = "0.1.1"
 dirs = "4.0.0"
-notion = { path = "../notion" }
 owo-colors = "3.2.0"
 serde = "1.0.133"
 serde_json = "1.0.74"
@@ -21,3 +20,6 @@ skim = "0.9.4"
 tokio = "1.15.0"
 tracing = "0.1.29"
 tracing-subscriber = "0.3.5"
+
+notion = { git = "https://github.com/lf-/notion", branch = "prepare-for-create-page" }
+#notion = { path = "../notion" }
