@@ -20,6 +20,11 @@ Currently it supports these column types:
 
 Install nightly Rust. See <https://rustup.rs>.
 
+Checkout this repository. You can run the software directly from this checkout
+by using `cargo run` in place of `notion-entry` in the commands that follow.
+You can also install the software into your home directory with
+`cargo install --locked --path .`.
+
 Create a Notion integration: <https://www.notion.so/my-integrations>.
 
 Share the database you want to enter data into and also any databases it has
